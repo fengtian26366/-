@@ -38,7 +38,8 @@ DATA_DIR = Path(
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-DB_PATH = DATA_DIR / "usdt_address_audit.db"
+# 每个群独立记录地址
+DB_PATH = DATA_DIR / "usdt_address_audit_group.db"
 
 
 # ==================================================
@@ -57,12 +58,10 @@ logger = logging.getLogger(__name__)
 # USDT 地址识别
 # ==================================================
 
-# TRC20 USDT 地址：T 开头，34 位
 TRC20_PATTERN = re.compile(
     r"(?<![A-Za-z0-9])T[1-9A-HJ-NP-Za-km-z]{33}(?![A-Za-z0-9])"
 )
 
-# ERC20 / BEP20 / Polygon 等 EVM 地址：0x + 40 位十六进制
 EVM_PATTERN = re.compile(
     r"(?<![A-Za-z0-9])0x[a-fA-F0-9]{40}(?![A-Za-z0-9])"
 )
@@ -154,7 +153,7 @@ def init_db():
             CREATE TABLE IF NOT EXISTS reviews (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 address TEXT NOT NULL,
-                address_normalized TEXT NOT NULL UNIQUE,
+                address_normalized TEXT NOT NULL,
                 address_type TEXT NOT NULL,
                 chat_id INTEGER NOT NULL,
                 original_message_id INTEGER NOT NULL,
@@ -168,17 +167,19 @@ def init_db():
                 operator_name TEXT,
                 created_at TEXT NOT NULL,
                 last_seen_at TEXT,
-                decided_at TEXT
+                decided_at TEXT,
+                UNIQUE(chat_id, address_normalized)
             )
             """
         )
 
-        # 兼容旧版数据库，自动补字段
+        # 兼容旧数据库，缺字段自动补
         add_column_if_missing(conn, "reviews", "sender_id", "sender_id INTEGER")
         add_column_if_missing(conn, "reviews", "sender_mention", "sender_mention TEXT")
         add_column_if_missing(conn, "reviews", "message_text", "message_text TEXT")
         add_column_if_missing(conn, "reviews", "occurrence_count", "occurrence_count INTEGER NOT NULL DEFAULT 1")
         add_column_if_missing(conn, "reviews", "last_seen_at", "last_seen_at TEXT")
+        add_column_if_missing(conn, "reviews", "decided_at", "decided_at TEXT")
 
         conn.commit()
 
@@ -193,11 +194,13 @@ def create_or_update_review(
     message_text: str,
 ):
     """
+    每个群独立记录地址。
+
     返回：
     review, is_new
 
-    is_new=True 代表第一次出现，需要 @ 管理员。
-    is_new=False 代表重复出现，不 @ 管理员，只记录出现次数。
+    is_new=True：这个地址在当前群第一次出现，@ 当前群管理员。
+    is_new=False：这个地址在当前群重复出现，只记录次数，不 @ 管理员。
     """
 
     normalized = normalize_address(address)
@@ -209,9 +212,13 @@ def create_or_update_review(
             """
             SELECT *
             FROM reviews
-            WHERE address_normalized = ?
+            WHERE chat_id = ?
+              AND address_normalized = ?
             """,
-            (normalized,),
+            (
+                chat_id,
+                normalized,
+            ),
         ).fetchone()
 
         if old:
@@ -222,11 +229,13 @@ def create_or_update_review(
                     occurrence_count = occurrence_count + 1,
                     last_seen_at = ?,
                     message_text = ?
-                WHERE address_normalized = ?
+                WHERE chat_id = ?
+                  AND address_normalized = ?
                 """,
                 (
                     now_text(),
                     message_text,
+                    chat_id,
                     normalized,
                 ),
             )
@@ -237,9 +246,13 @@ def create_or_update_review(
                 """
                 SELECT *
                 FROM reviews
-                WHERE address_normalized = ?
+                WHERE chat_id = ?
+                  AND address_normalized = ?
                 """,
-                (normalized,),
+                (
+                    chat_id,
+                    normalized,
+                ),
             ).fetchone()
 
             return review, False
@@ -279,7 +292,6 @@ def create_or_update_review(
         )
 
         review_id = cursor.lastrowid
-
         conn.commit()
 
         review = conn.execute(
@@ -316,6 +328,13 @@ def finish_review(
     operator_id: int,
     operator_name: str,
 ) -> bool:
+    """
+    管理员点击确认后，记录：
+    - 出 / 不出
+    - 确认人
+    - 每次确认时间 decided_at
+    """
+
     with db_conn() as conn:
         cursor = conn.execute(
             """
@@ -342,22 +361,45 @@ def finish_review(
         return cursor.rowcount == 1
 
 
-def get_stats():
+def get_stats(chat_id: int | None = None):
     with db_conn() as conn:
+        if chat_id is None:
+            total = conn.execute(
+                "SELECT COUNT(*) FROM reviews"
+            ).fetchone()[0]
+
+            pending = conn.execute(
+                "SELECT COUNT(*) FROM reviews WHERE status = 'pending'"
+            ).fetchone()[0]
+
+            out_count = conn.execute(
+                "SELECT COUNT(*) FROM reviews WHERE status = 'out'"
+            ).fetchone()[0]
+
+            no_count = conn.execute(
+                "SELECT COUNT(*) FROM reviews WHERE status = 'no'"
+            ).fetchone()[0]
+
+            return total, pending, out_count, no_count
+
         total = conn.execute(
-            "SELECT COUNT(*) FROM reviews"
+            "SELECT COUNT(*) FROM reviews WHERE chat_id = ?",
+            (chat_id,),
         ).fetchone()[0]
 
         pending = conn.execute(
-            "SELECT COUNT(*) FROM reviews WHERE status = 'pending'"
+            "SELECT COUNT(*) FROM reviews WHERE chat_id = ? AND status = 'pending'",
+            (chat_id,),
         ).fetchone()[0]
 
         out_count = conn.execute(
-            "SELECT COUNT(*) FROM reviews WHERE status = 'out'"
+            "SELECT COUNT(*) FROM reviews WHERE chat_id = ? AND status = 'out'",
+            (chat_id,),
         ).fetchone()[0]
 
         no_count = conn.execute(
-            "SELECT COUNT(*) FROM reviews WHERE status = 'no'"
+            "SELECT COUNT(*) FROM reviews WHERE chat_id = ? AND status = 'no'",
+            (chat_id,),
         ).fetchone()[0]
 
     return total, pending, out_count, no_count
@@ -490,7 +532,6 @@ def build_record_text(
 
     text = "🚨 <b>USDT 地址记录</b>\n\n"
 
-    # 只有第一次出现新地址时才会传 show_admin_mentions
     if show_admin_mentions:
         text += f"管理员：{show_admin_mentions}\n"
 
@@ -505,6 +546,7 @@ def build_record_text(
     if review["operator_name"]:
         text += f"确认人：{html.escape(review['operator_name'])}\n"
 
+    # 新增：每次管理员点击“出 / 不出”后的确认时间
     if review["decided_at"]:
         text += f"确认时间：{html.escape(review['decided_at'])}\n"
 
@@ -529,7 +571,7 @@ async def start(
 
     await update.message.reply_text(
         "USDT 地址审核机器人已启动。\n\n"
-        "新地址会 @ 管理员，重复地址只记录出现次数。"
+        "每个群独立记录地址。新地址会 @ 当前群管理员，重复地址只记录出现次数。"
     )
 
 
@@ -540,10 +582,17 @@ async def stats(
     if not update.message:
         return
 
-    total, pending, out_count, no_count = get_stats()
+    chat = update.effective_chat
+
+    if chat and chat.type in ("group", "supergroup"):
+        total, pending, out_count, no_count = get_stats(chat.id)
+        title = "📊 当前群地址审核统计"
+    else:
+        total, pending, out_count, no_count = get_stats(None)
+        title = "📊 全部群地址审核统计"
 
     await update.message.reply_text(
-        "📊 地址审核统计\n\n"
+        f"{title}\n\n"
         f"全部命中地址：{total}\n"
         f"待处理：{pending}\n"
         f"已确认出：{out_count}\n"
@@ -597,15 +646,12 @@ async def handle_message(
         keyboard = None
         admin_mentions = ""
 
-        # 只有第一次出现新地址时 @ 管理员
         if is_new:
             admin_mentions = await get_admin_mentions(
                 context=context,
                 chat_id=chat.id,
             )
 
-        # 只要这个地址还没确认，就显示按钮。
-        # 重复出现时也会显示按钮，但不会 @ 管理员。
         if review["status"] == "pending":
             keyboard = InlineKeyboardMarkup(
                 [
@@ -692,7 +738,6 @@ async def handle_button(
 
     updated_review = get_review(review_id)
 
-    # 如果已经被其他管理员点过，则刷新当前按钮消息为最终状态
     if not success:
         old_operator = updated_review["operator_name"] or "其他管理员"
 
@@ -713,7 +758,7 @@ async def handle_button(
 
         return
 
-    # 成功处理后，只编辑当前机器人警报消息，不额外再发第二条
+    # 点击“出 / 不出”后，只编辑当前机器人消息，并显示确认人、确认时间
     try:
         await query.edit_message_text(
             text=build_record_text(updated_review),
@@ -762,13 +807,8 @@ def main():
         .build()
     )
 
-    app.add_handler(
-        CommandHandler("start", start)
-    )
-
-    app.add_handler(
-        CommandHandler("stats", stats)
-    )
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("stats", stats))
 
     app.add_handler(
         CallbackQueryHandler(
