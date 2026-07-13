@@ -51,7 +51,7 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 # 每个群独立记录地址；每次出现都会有按钮
 # 继续沿用上一版数据库，不清空数据
-DB_PATH = DATA_DIR / "usdt_address_audit_every_time.db"
+DB_PATH = DATA_DIR / "usdt_address_audit_clean_v1.db"
 
 
 # ==================================================
@@ -366,7 +366,7 @@ def finish_event(
 ) -> bool:
     """
     管理员点击“出款成功 / 未成功”后，记录本次确认：
-    - 出款成功 / 不给出款
+    - 出款成功 / 不出
     - 确认人
     - 确认时间
     """
@@ -401,7 +401,7 @@ def get_sender_stats(chat_id: int, sender_id: int | None, sender_name: str | Non
     """
     统计当前群里这个发送人的总记录：
     - 出款成功次数：status='out'
-    - 不给出款次数：status='no'
+    - 不出次数：status='no'
 
     优先按 sender_id 统计；没有 sender_id 时按 sender_name 兜底。
     """
@@ -472,10 +472,9 @@ def get_sender_stats(chat_id: int, sender_id: int | None, sender_name: str | Non
 
 def get_address_stats(chat_id: int, address_normalized: str):
     """
-    统计当前群里这个地址的审核结果：
+    只统计当前群、当前地址：
     - 出款成功次数
-    - 不给出款次数
-    - 待处理次数
+    - 不出次数
     """
     with db_conn() as conn:
         success_count = conn.execute(
@@ -492,7 +491,7 @@ def get_address_stats(chat_id: int, address_normalized: str):
             ),
         ).fetchone()[0]
 
-        fail_count = conn.execute(
+        no_count = conn.execute(
             """
             SELECT COUNT(*)
             FROM events
@@ -506,21 +505,7 @@ def get_address_stats(chat_id: int, address_normalized: str):
             ),
         ).fetchone()[0]
 
-        pending_count = conn.execute(
-            """
-            SELECT COUNT(*)
-            FROM events
-            WHERE chat_id = ?
-              AND address_normalized = ?
-              AND status = 'pending'
-            """,
-            (
-                chat_id,
-                address_normalized,
-            ),
-        ).fetchone()[0]
-
-    return success_count, fail_count, pending_count
+    return success_count, no_count
 
 
 def get_stats(chat_id: int | None = None):
@@ -715,13 +700,7 @@ def build_event_text(
     if not message_sent_at:
         message_sent_at = safe_get(event, "created_at", "")
 
-    sender_success_count, sender_fail_count = get_sender_stats(
-        chat_id=event["chat_id"],
-        sender_id=safe_get(event, "sender_id", None),
-        sender_name=safe_get(event, "sender_name", None),
-    )
-
-    address_success_count, address_fail_count, address_pending_count = get_address_stats(
+    address_success_count, address_no_count = get_address_stats(
         chat_id=event["chat_id"],
         address_normalized=event["address_normalized"],
     )
@@ -735,16 +714,11 @@ def build_event_text(
     text += (
         f"发送人：{sender}\n"
         f"发送时间：{html.escape(message_sent_at)}\n\n"
-        f"本地址统计：\n"
-        f"出现次数：{occurrence_no} 次\n"
-        f"出款成功：{address_success_count} 次\n"
-        f"不给出款：{address_fail_count} 次\n"
-        f"待处理：{address_pending_count} 次\n\n"
-        f"该发送人总统计：\n"
-        f"出款成功：{sender_success_count} 次\n"
-        f"不给出款：{sender_fail_count} 次\n\n"
         f"USDT 地址：\n<code>{address}</code>\n\n"
         f"类型：{address_type}\n"
+        f"地址出现次数：{occurrence_no}\n"
+        f"本地址出款成功：{address_success_count} 次\n"
+        f"本地址不出：{address_no_count} 次\n"
         f"本次状态：{status_text}\n"
     )
 
@@ -776,7 +750,7 @@ async def start(
     await update.message.reply_text(
         "USDT 地址审核机器人已启动。\n\n"
         "每个群独立记录地址。新地址会 @ 当前群管理员；重复地址不 @，但每次都会有按钮。\n"
-        "每个发送人会统计：出款成功次数 / 不给出款次数。"
+        "每个发送人会统计：出款成功次数 / 不出次数。"
     )
 
 
@@ -800,9 +774,8 @@ async def stats(
         f"{title}\n\n"
         f"去重地址数：{total_address}\n"
         f"总出现次数：{total_event}\n"
-        f"待处理：{pending}\n"
         f"出款成功：{success_count}\n"
-        f"不给出款：{fail_count}"
+        f"不出：{fail_count}"
     )
 
 
@@ -966,7 +939,7 @@ async def handle_button(
 
         return
 
-    # 点击后只编辑当前机器人消息，并显示确认人、确认时间、该发送人的累计成功/不给出款次数
+    # 点击后只编辑当前机器人消息，并显示确认人、确认时间、该发送人的累计成功/不出次数
     try:
         await query.edit_message_text(
             text=build_event_text(updated_event),
