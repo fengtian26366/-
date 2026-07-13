@@ -1,5 +1,6 @@
 import os
 import re
+import html
 import sqlite3
 import logging
 from pathlib import Path
@@ -9,6 +10,7 @@ from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    ReplyParameters,
 )
 from telegram.ext import (
     ApplicationBuilder,
@@ -24,13 +26,8 @@ from telegram.ext import (
 # 配置
 # ==================================================
 
-# Railway 里添加环境变量 BOT_TOKEN
-# 不要把 Token 写死到代码里
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
-# Railway 持久化 Volume 路径
-# 如果你在 Railway 里挂载了 Volume，一般会自动提供 RAILWAY_VOLUME_MOUNT_PATH
-# 本地测试时会使用当前目录下的 data 文件夹
 BASE_DIR = Path(__file__).resolve().parent
 
 DATA_DIR = Path(
@@ -61,32 +58,13 @@ logger = logging.getLogger(__name__)
 # USDT 地址识别
 # ==================================================
 
-# USDT-TRC20：T 开头，常见 34 位
 TRC20_PATTERN = re.compile(
     r"(?<![A-Za-z0-9])T[1-9A-HJ-NP-Za-km-z]{33}(?![A-Za-z0-9])"
 )
 
-# USDT-ERC20 / BEP20：0x + 40 位十六进制
 EVM_PATTERN = re.compile(
     r"(?<![A-Za-z0-9])0x[a-fA-F0-9]{40}(?![A-Za-z0-9])"
 )
-
-
-def detect_addresses(text: str) -> list[str]:
-    addresses = []
-    addresses.extend(TRC20_PATTERN.findall(text))
-    addresses.extend(EVM_PATTERN.findall(text))
-
-    result = []
-    seen = set()
-
-    for address in addresses:
-        key = normalize_address(address)
-        if key not in seen:
-            seen.add(key)
-            result.append(address)
-
-    return result
 
 
 def normalize_address(address: str) -> str:
@@ -108,12 +86,37 @@ def get_address_type(address: str) -> str:
     return "USDT"
 
 
+def detect_addresses(text: str) -> list[str]:
+    addresses = []
+
+    addresses.extend(
+        TRC20_PATTERN.findall(text)
+    )
+
+    addresses.extend(
+        EVM_PATTERN.findall(text)
+    )
+
+    result = []
+    seen = set()
+
+    for address in addresses:
+        key = normalize_address(address)
+
+        if key not in seen:
+            seen.add(key)
+            result.append(address)
+
+    return result
+
+
 # ==================================================
 # 数据库
 # ==================================================
 
 def db_conn():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+
     return sqlite3.connect(
         str(DB_PATH),
         timeout=30,
@@ -184,7 +187,6 @@ def create_review(
             return cursor.lastrowid
 
     except sqlite3.IntegrityError:
-        # 地址已存在，不重复报警
         return None
 
 
@@ -294,6 +296,45 @@ async def is_admin(
         return False
 
 
+async def get_admin_mentions(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+) -> str:
+    mentions = []
+
+    try:
+        admins = await context.bot.get_chat_administrators(
+            chat_id=chat_id
+        )
+
+        for admin in admins:
+            user = admin.user
+
+            if user.is_bot:
+                continue
+
+            if user.username:
+                mentions.append(
+                    f"@{html.escape(user.username)}"
+                )
+            else:
+                name = html.escape(
+                    user.full_name or str(user.id)
+                )
+
+                mentions.append(
+                    f'<a href="tg://user?id={user.id}">{name}</a>'
+                )
+
+    except Exception as e:
+        logger.error("获取管理员列表失败: %s", e)
+
+    if not mentions:
+        return ""
+
+    return " ".join(mentions)
+
+
 # ==================================================
 # 命令
 # ==================================================
@@ -344,7 +385,6 @@ async def handle_message(
     if not message or not chat:
         return
 
-    # 只处理群和超级群
     if chat.type not in ("group", "supergroup"):
         return
 
@@ -360,6 +400,11 @@ async def handle_message(
 
     sender_name = get_user_name(user)
 
+    admin_mentions = await get_admin_mentions(
+        context=context,
+        chat_id=chat.id,
+    )
+
     for address in addresses:
         review_id = create_review(
             address=address,
@@ -368,7 +413,6 @@ async def handle_message(
             sender_name=sender_name,
         )
 
-        # 地址已存在，不重复报警
         if review_id is None:
             continue
 
@@ -387,16 +431,33 @@ async def handle_message(
             ]
         )
 
+        safe_address = html.escape(address)
+        safe_address_type = html.escape(
+            get_address_type(address)
+        )
+
+        if admin_mentions:
+            mention_line = f"{admin_mentions}\n\n"
+        else:
+            mention_line = ""
+
         alert_text = (
-            "🚨 警报：发现新地址\n\n"
-            f"类型：{get_address_type(address)}\n"
-            f"地址：{address}\n\n"
+            "🚨 <b>警报：发现新地址</b>\n\n"
+            f"{mention_line}"
+            f"类型：{safe_address_type}\n"
+            f"地址：<code>{safe_address}</code>\n\n"
             "是否出款？"
         )
 
-        await message.reply_text(
+        await context.bot.send_message(
+            chat_id=chat.id,
             text=alert_text,
+            parse_mode="HTML",
             reply_markup=keyboard,
+            reply_parameters=ReplyParameters(
+                message_id=message.message_id,
+                allow_sending_without_reply=True,
+            ),
         )
 
 
@@ -471,6 +532,11 @@ async def handle_button(
     else:
         result = "❌ 不出"
 
+    safe_result = html.escape(result)
+    safe_address = html.escape(review["address"])
+    safe_operator = html.escape(operator_name)
+    safe_type = html.escape(review["address_type"])
+
     try:
         await query.edit_message_reply_markup(
             reply_markup=None
@@ -482,11 +548,16 @@ async def handle_button(
         await context.bot.send_message(
             chat_id=review["chat_id"],
             text=(
-                f"{result}\n\n"
-                f"地址：{review['address']}\n"
-                f"操作人：{operator_name}"
+                f"<b>{safe_result}</b>\n\n"
+                f"类型：{safe_type}\n"
+                f"地址：<code>{safe_address}</code>\n"
+                f"操作人：{safe_operator}"
             ),
-            reply_to_message_id=review["original_message_id"],
+            parse_mode="HTML",
+            reply_parameters=ReplyParameters(
+                message_id=review["original_message_id"],
+                allow_sending_without_reply=True,
+            ),
         )
 
     except Exception as e:
