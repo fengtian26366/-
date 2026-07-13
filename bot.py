@@ -49,7 +49,8 @@ DATA_DIR = Path(
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-# 每个群独立记录地址；本版每次出现都会生成一条独立审核记录
+# 每个群独立记录地址；每次出现都会有按钮
+# 继续沿用上一版数据库，不清空数据
 DB_PATH = DATA_DIR / "usdt_address_audit_every_time.db"
 
 
@@ -211,7 +212,7 @@ def create_event_for_address(
 ):
     """
     每个群独立记录地址。
-    每次出现地址，都会生成一条独立 event，所以每次都有按钮。
+    每次出现地址，都会生成一条独立审核记录，所以每次都有按钮。
 
     返回：
     event, is_new_address
@@ -327,7 +328,6 @@ def create_event_for_address(
         )
 
         event_id = cursor.lastrowid
-
         conn.commit()
 
         event = conn.execute(
@@ -365,8 +365,8 @@ def finish_event(
     operator_name: str,
 ) -> bool:
     """
-    管理员点击“出 / 不出”后，记录本次确认：
-    - 出 / 不出
+    管理员点击“出款成功 / 未成功”后，记录本次确认：
+    - 出款成功 / 不给出款
     - 确认人
     - 确认时间
     """
@@ -397,6 +397,78 @@ def finish_event(
         return cursor.rowcount == 1
 
 
+def get_sender_stats(chat_id: int, sender_id: int | None, sender_name: str | None):
+    """
+    统计当前群里这个发送人的总记录：
+    - 出款成功次数：status='out'
+    - 不给出款次数：status='no'
+
+    优先按 sender_id 统计；没有 sender_id 时按 sender_name 兜底。
+    """
+
+    with db_conn() as conn:
+        if sender_id is not None:
+            success_count = conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM events
+                WHERE chat_id = ?
+                  AND sender_id = ?
+                  AND status = 'out'
+                """,
+                (
+                    chat_id,
+                    sender_id,
+                ),
+            ).fetchone()[0]
+
+            fail_count = conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM events
+                WHERE chat_id = ?
+                  AND sender_id = ?
+                  AND status = 'no'
+                """,
+                (
+                    chat_id,
+                    sender_id,
+                ),
+            ).fetchone()[0]
+
+            return success_count, fail_count
+
+        success_count = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM events
+            WHERE chat_id = ?
+              AND sender_name = ?
+              AND status = 'out'
+            """,
+            (
+                chat_id,
+                sender_name,
+            ),
+        ).fetchone()[0]
+
+        fail_count = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM events
+            WHERE chat_id = ?
+              AND sender_name = ?
+              AND status = 'no'
+            """,
+            (
+                chat_id,
+                sender_name,
+            ),
+        ).fetchone()[0]
+
+    return success_count, fail_count
+
+
 def get_stats(chat_id: int | None = None):
     with db_conn() as conn:
         if chat_id is None:
@@ -412,15 +484,15 @@ def get_stats(chat_id: int | None = None):
                 "SELECT COUNT(*) FROM events WHERE status = 'pending'"
             ).fetchone()[0]
 
-            out_count = conn.execute(
+            success_count = conn.execute(
                 "SELECT COUNT(*) FROM events WHERE status = 'out'"
             ).fetchone()[0]
 
-            no_count = conn.execute(
+            fail_count = conn.execute(
                 "SELECT COUNT(*) FROM events WHERE status = 'no'"
             ).fetchone()[0]
 
-            return total_address, total_event, pending, out_count, no_count
+            return total_address, total_event, pending, success_count, fail_count
 
         total_address = conn.execute(
             "SELECT COUNT(*) FROM addresses WHERE chat_id = ?",
@@ -437,17 +509,17 @@ def get_stats(chat_id: int | None = None):
             (chat_id,),
         ).fetchone()[0]
 
-        out_count = conn.execute(
+        success_count = conn.execute(
             "SELECT COUNT(*) FROM events WHERE chat_id = ? AND status = 'out'",
             (chat_id,),
         ).fetchone()[0]
 
-        no_count = conn.execute(
+        fail_count = conn.execute(
             "SELECT COUNT(*) FROM events WHERE chat_id = ? AND status = 'no'",
             (chat_id,),
         ).fetchone()[0]
 
-    return total_address, total_event, pending, out_count, no_count
+    return total_address, total_event, pending, success_count, fail_count
 
 
 # ==================================================
@@ -549,10 +621,10 @@ def build_status_text(event) -> str:
         return "⏳ 待确认"
 
     if status == "out":
-        return "✅ 已确认出"
+        return "✅ 出"
 
     if status == "no":
-        return "❌ 已确认不出"
+        return "❌ 不出"
 
     return status
 
@@ -589,6 +661,12 @@ def build_event_text(
     if not message_sent_at:
         message_sent_at = safe_get(event, "created_at", "")
 
+    sender_success_count, sender_fail_count = get_sender_stats(
+        chat_id=event["chat_id"],
+        sender_id=safe_get(event, "sender_id", None),
+        sender_name=safe_get(event, "sender_name", None),
+    )
+
     text = "🚨 <b>USDT 地址记录</b>\n\n"
 
     # 只有当前群第一次出现新地址才 @ 管理员
@@ -598,10 +676,13 @@ def build_event_text(
     text += (
         f"发送人：{sender}\n"
         f"发送时间：{html.escape(message_sent_at)}\n\n"
+        f"该发送人统计：\n"
+        f"出款成功：{sender_success_count} 次\n"
+        f"不给出款：{sender_fail_count} 次\n\n"
         f"USDT 地址：\n<code>{address}</code>\n\n"
         f"类型：{address_type}\n"
-        f"出现次数：{occurrence_no}\n"
-        f"是否确认：{status_text}\n"
+        f"地址出现次数：{occurrence_no}\n"
+        f"本次状态：{status_text}\n"
     )
 
     if safe_get(event, "operator_name"):
@@ -631,7 +712,8 @@ async def start(
 
     await update.message.reply_text(
         "USDT 地址审核机器人已启动。\n\n"
-        "每个群独立记录地址。新地址会 @ 当前群管理员；重复地址不 @，但每次都会有按钮。"
+        "每个群独立记录地址。新地址会 @ 当前群管理员；重复地址不 @，但每次都会有按钮。\n"
+        "每个发送人会统计：出款成功次数 / 不给出款次数。"
     )
 
 
@@ -645,19 +727,19 @@ async def stats(
     chat = update.effective_chat
 
     if chat and chat.type in ("group", "supergroup"):
-        total_address, total_event, pending, out_count, no_count = get_stats(chat.id)
-        title = "📊 当前群地址审核统计"
+        total_address, total_event, pending, success_count, fail_count = get_stats(chat.id)
+        title = "📊 当前群出款统计"
     else:
-        total_address, total_event, pending, out_count, no_count = get_stats(None)
-        title = "📊 全部群地址审核统计"
+        total_address, total_event, pending, success_count, fail_count = get_stats(None)
+        title = "📊 全部群出款统计"
 
     await update.message.reply_text(
         f"{title}\n\n"
         f"去重地址数：{total_address}\n"
         f"总出现次数：{total_event}\n"
         f"待处理：{pending}\n"
-        f"已确认出：{out_count}\n"
-        f"已确认不出：{no_count}"
+        f"出款成功：{success_count}\n"
+        f"不给出款：{fail_count}"
     )
 
 
@@ -821,7 +903,7 @@ async def handle_button(
 
         return
 
-    # 点击“出 / 不出”后，只编辑当前机器人消息，并显示确认人、确认时间
+    # 点击后只编辑当前机器人消息，并显示确认人、确认时间、该发送人的累计成功/不给出款次数
     try:
         await query.edit_message_text(
             text=build_event_text(updated_event),
