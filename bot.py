@@ -5,6 +5,7 @@ import sqlite3
 import logging
 from pathlib import Path
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from telegram import (
     Update,
@@ -27,6 +28,16 @@ from telegram.ext import (
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
+# 默认中国时间。Railway Variables 可加：
+# BOT_TIMEZONE=Asia/Shanghai
+# BOT_TIMEZONE=Asia/Colombo
+BOT_TIMEZONE = os.getenv("BOT_TIMEZONE", "Asia/Shanghai").strip()
+
+try:
+    LOCAL_TZ = ZoneInfo(BOT_TIMEZONE)
+except Exception:
+    LOCAL_TZ = ZoneInfo("Asia/Shanghai")
+
 BASE_DIR = Path(__file__).resolve().parent
 
 DATA_DIR = Path(
@@ -38,8 +49,8 @@ DATA_DIR = Path(
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-# 每个群独立记录地址
-DB_PATH = DATA_DIR / "usdt_address_audit_group.db"
+# 每个群独立记录地址；本版每次出现都会生成一条独立审核记录
+DB_PATH = DATA_DIR / "usdt_address_audit_every_time.db"
 
 
 # ==================================================
@@ -68,7 +79,17 @@ EVM_PATTERN = re.compile(
 
 
 def now_text() -> str:
-    return datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+    return datetime.now(LOCAL_TZ).strftime("%Y/%m/%d %H:%M:%S")
+
+
+def format_dt(dt: datetime | None) -> str:
+    if not dt:
+        return now_text()
+
+    try:
+        return dt.astimezone(LOCAL_TZ).strftime("%Y/%m/%d %H:%M:%S")
+    except Exception:
+        return now_text()
 
 
 def normalize_address(address: str) -> str:
@@ -131,60 +152,54 @@ def db_conn():
     )
 
 
-def add_column_if_missing(
-    conn,
-    table_name: str,
-    column_name: str,
-    column_sql: str,
-):
-    cursor = conn.execute(f"PRAGMA table_info({table_name})")
-    columns = [row[1] for row in cursor.fetchall()]
-
-    if column_name not in columns:
-        conn.execute(
-            f"ALTER TABLE {table_name} ADD COLUMN {column_sql}"
-        )
-
-
 def init_db():
     with db_conn() as conn:
         conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS reviews (
+            CREATE TABLE IF NOT EXISTS addresses (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
                 address TEXT NOT NULL,
                 address_normalized TEXT NOT NULL,
                 address_type TEXT NOT NULL,
-                chat_id INTEGER NOT NULL,
-                original_message_id INTEGER NOT NULL,
-                sender_id INTEGER,
-                sender_name TEXT,
-                sender_mention TEXT,
-                message_text TEXT,
                 occurrence_count INTEGER NOT NULL DEFAULT 1,
-                status TEXT NOT NULL DEFAULT 'pending',
-                operator_id INTEGER,
-                operator_name TEXT,
-                created_at TEXT NOT NULL,
-                last_seen_at TEXT,
-                decided_at TEXT,
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
                 UNIQUE(chat_id, address_normalized)
             )
             """
         )
 
-        # 兼容旧数据库，缺字段自动补
-        add_column_if_missing(conn, "reviews", "sender_id", "sender_id INTEGER")
-        add_column_if_missing(conn, "reviews", "sender_mention", "sender_mention TEXT")
-        add_column_if_missing(conn, "reviews", "message_text", "message_text TEXT")
-        add_column_if_missing(conn, "reviews", "occurrence_count", "occurrence_count INTEGER NOT NULL DEFAULT 1")
-        add_column_if_missing(conn, "reviews", "last_seen_at", "last_seen_at TEXT")
-        add_column_if_missing(conn, "reviews", "decided_at", "decided_at TEXT")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                address_id INTEGER NOT NULL,
+                chat_id INTEGER NOT NULL,
+                address TEXT NOT NULL,
+                address_normalized TEXT NOT NULL,
+                address_type TEXT NOT NULL,
+                original_message_id INTEGER NOT NULL,
+                sender_id INTEGER,
+                sender_name TEXT,
+                sender_mention TEXT,
+                message_text TEXT,
+                message_sent_at TEXT,
+                occurrence_no INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                operator_id INTEGER,
+                operator_name TEXT,
+                created_at TEXT NOT NULL,
+                decided_at TEXT,
+                FOREIGN KEY(address_id) REFERENCES addresses(id)
+            )
+            """
+        )
 
         conn.commit()
 
 
-def create_or_update_review(
+def create_event_for_address(
     address: str,
     chat_id: int,
     original_message_id: int,
@@ -192,18 +207,21 @@ def create_or_update_review(
     sender_name: str,
     sender_mention: str,
     message_text: str,
+    message_sent_at: str,
 ):
     """
     每个群独立记录地址。
+    每次出现地址，都会生成一条独立 event，所以每次都有按钮。
 
     返回：
-    review, is_new
+    event, is_new_address
 
-    is_new=True：这个地址在当前群第一次出现，@ 当前群管理员。
-    is_new=False：这个地址在当前群重复出现，只记录次数，不 @ 管理员。
+    is_new_address=True：当前群第一次出现该地址，@ 当前群管理员。
+    is_new_address=False：当前群重复出现该地址，不 @ 管理员，但仍然有按钮。
     """
 
     normalized = normalize_address(address)
+    address_type = get_address_type(address)
 
     with db_conn() as conn:
         conn.row_factory = sqlite3.Row
@@ -211,7 +229,7 @@ def create_or_update_review(
         old = conn.execute(
             """
             SELECT *
-            FROM reviews
+            FROM addresses
             WHERE chat_id = ?
               AND address_normalized = ?
             """,
@@ -222,123 +240,141 @@ def create_or_update_review(
         ).fetchone()
 
         if old:
+            occurrence_no = int(old["occurrence_count"]) + 1
+
             conn.execute(
                 """
-                UPDATE reviews
+                UPDATE addresses
                 SET
-                    occurrence_count = occurrence_count + 1,
-                    last_seen_at = ?,
-                    message_text = ?
-                WHERE chat_id = ?
-                  AND address_normalized = ?
+                    occurrence_count = ?,
+                    last_seen_at = ?
+                WHERE id = ?
                 """,
                 (
+                    occurrence_no,
                     now_text(),
-                    message_text,
-                    chat_id,
-                    normalized,
+                    old["id"],
                 ),
             )
 
-            conn.commit()
+            address_id = old["id"]
+            is_new_address = False
 
-            review = conn.execute(
+        else:
+            occurrence_no = 1
+
+            cursor = conn.execute(
                 """
-                SELECT *
-                FROM reviews
-                WHERE chat_id = ?
-                  AND address_normalized = ?
+                INSERT INTO addresses (
+                    chat_id,
+                    address,
+                    address_normalized,
+                    address_type,
+                    occurrence_count,
+                    first_seen_at,
+                    last_seen_at
+                )
+                VALUES (?, ?, ?, ?, 1, ?, ?)
                 """,
                 (
                     chat_id,
+                    address,
                     normalized,
+                    address_type,
+                    now_text(),
+                    now_text(),
                 ),
-            ).fetchone()
+            )
 
-            return review, False
+            address_id = cursor.lastrowid
+            is_new_address = True
 
         cursor = conn.execute(
             """
-            INSERT INTO reviews (
+            INSERT INTO events (
+                address_id,
+                chat_id,
                 address,
                 address_normalized,
                 address_type,
-                chat_id,
                 original_message_id,
                 sender_id,
                 sender_name,
                 sender_mention,
                 message_text,
-                occurrence_count,
+                message_sent_at,
+                occurrence_no,
                 status,
-                created_at,
-                last_seen_at
+                created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'pending', ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
             """,
             (
+                address_id,
+                chat_id,
                 address,
                 normalized,
-                get_address_type(address),
-                chat_id,
+                address_type,
                 original_message_id,
                 sender_id,
                 sender_name,
                 sender_mention,
                 message_text,
-                now_text(),
+                message_sent_at,
+                occurrence_no,
                 now_text(),
             ),
         )
 
-        review_id = cursor.lastrowid
+        event_id = cursor.lastrowid
+
         conn.commit()
 
-        review = conn.execute(
+        event = conn.execute(
             """
             SELECT *
-            FROM reviews
+            FROM events
             WHERE id = ?
             """,
-            (review_id,),
+            (event_id,),
         ).fetchone()
 
-        return review, True
+        return event, is_new_address
 
 
-def get_review(review_id: int):
+def get_event(event_id: int):
     with db_conn() as conn:
         conn.row_factory = sqlite3.Row
 
         cursor = conn.execute(
             """
             SELECT *
-            FROM reviews
+            FROM events
             WHERE id = ?
             """,
-            (review_id,),
+            (event_id,),
         )
 
         return cursor.fetchone()
 
 
-def finish_review(
-    review_id: int,
+def finish_event(
+    event_id: int,
     status: str,
     operator_id: int,
     operator_name: str,
 ) -> bool:
     """
-    管理员点击确认后，记录：
+    管理员点击“出 / 不出”后，记录本次确认：
     - 出 / 不出
     - 确认人
-    - 每次确认时间 decided_at
+    - 确认时间
     """
 
     with db_conn() as conn:
         cursor = conn.execute(
             """
-            UPDATE reviews
+            UPDATE events
             SET
                 status = ?,
                 operator_id = ?,
@@ -353,7 +389,7 @@ def finish_review(
                 operator_id,
                 operator_name,
                 now_text(),
-                review_id,
+                event_id,
             ),
         )
 
@@ -364,45 +400,54 @@ def finish_review(
 def get_stats(chat_id: int | None = None):
     with db_conn() as conn:
         if chat_id is None:
-            total = conn.execute(
-                "SELECT COUNT(*) FROM reviews"
+            total_address = conn.execute(
+                "SELECT COUNT(*) FROM addresses"
+            ).fetchone()[0]
+
+            total_event = conn.execute(
+                "SELECT COUNT(*) FROM events"
             ).fetchone()[0]
 
             pending = conn.execute(
-                "SELECT COUNT(*) FROM reviews WHERE status = 'pending'"
+                "SELECT COUNT(*) FROM events WHERE status = 'pending'"
             ).fetchone()[0]
 
             out_count = conn.execute(
-                "SELECT COUNT(*) FROM reviews WHERE status = 'out'"
+                "SELECT COUNT(*) FROM events WHERE status = 'out'"
             ).fetchone()[0]
 
             no_count = conn.execute(
-                "SELECT COUNT(*) FROM reviews WHERE status = 'no'"
+                "SELECT COUNT(*) FROM events WHERE status = 'no'"
             ).fetchone()[0]
 
-            return total, pending, out_count, no_count
+            return total_address, total_event, pending, out_count, no_count
 
-        total = conn.execute(
-            "SELECT COUNT(*) FROM reviews WHERE chat_id = ?",
+        total_address = conn.execute(
+            "SELECT COUNT(*) FROM addresses WHERE chat_id = ?",
+            (chat_id,),
+        ).fetchone()[0]
+
+        total_event = conn.execute(
+            "SELECT COUNT(*) FROM events WHERE chat_id = ?",
             (chat_id,),
         ).fetchone()[0]
 
         pending = conn.execute(
-            "SELECT COUNT(*) FROM reviews WHERE chat_id = ? AND status = 'pending'",
+            "SELECT COUNT(*) FROM events WHERE chat_id = ? AND status = 'pending'",
             (chat_id,),
         ).fetchone()[0]
 
         out_count = conn.execute(
-            "SELECT COUNT(*) FROM reviews WHERE chat_id = ? AND status = 'out'",
+            "SELECT COUNT(*) FROM events WHERE chat_id = ? AND status = 'out'",
             (chat_id,),
         ).fetchone()[0]
 
         no_count = conn.execute(
-            "SELECT COUNT(*) FROM reviews WHERE chat_id = ? AND status = 'no'",
+            "SELECT COUNT(*) FROM events WHERE chat_id = ? AND status = 'no'",
             (chat_id,),
         ).fetchone()[0]
 
-    return total, pending, out_count, no_count
+    return total_address, total_event, pending, out_count, no_count
 
 
 # ==================================================
@@ -497,8 +542,8 @@ async def get_admin_mentions(
 # 消息内容
 # ==================================================
 
-def build_status_text(review) -> str:
-    status = review["status"]
+def build_status_text(event) -> str:
+    status = event["status"]
 
     if status == "pending":
         return "⏳ 待确认"
@@ -512,43 +557,58 @@ def build_status_text(review) -> str:
     return status
 
 
-def build_record_text(
-    review,
+def safe_get(row, key: str, default=""):
+    try:
+        value = row[key]
+        if value is None:
+            return default
+        return value
+    except Exception:
+        return default
+
+
+def build_event_text(
+    event,
     show_admin_mentions: str = "",
 ) -> str:
-    address = html.escape(review["address"])
-    address_type = html.escape(review["address_type"])
-    occurrence_count = review["occurrence_count"]
-    status_text = html.escape(build_status_text(review))
+    address = html.escape(event["address"])
+    address_type = html.escape(event["address_type"])
+    occurrence_no = event["occurrence_no"]
+    status_text = html.escape(build_status_text(event))
 
     sender = (
-        review["sender_mention"]
-        or html.escape(review["sender_name"] or "未知用户")
+        safe_get(event, "sender_mention")
+        or html.escape(safe_get(event, "sender_name", "未知用户"))
     )
 
     message_text = html.escape(
-        short_text(review["message_text"] or "")
+        short_text(safe_get(event, "message_text", ""))
     )
+
+    message_sent_at = safe_get(event, "message_sent_at")
+    if not message_sent_at:
+        message_sent_at = safe_get(event, "created_at", "")
 
     text = "🚨 <b>USDT 地址记录</b>\n\n"
 
+    # 只有当前群第一次出现新地址才 @ 管理员
     if show_admin_mentions:
         text += f"管理员：{show_admin_mentions}\n"
 
     text += (
-        f"发送人：{sender}\n\n"
+        f"发送人：{sender}\n"
+        f"发送时间：{html.escape(message_sent_at)}\n\n"
         f"USDT 地址：\n<code>{address}</code>\n\n"
         f"类型：{address_type}\n"
-        f"出现次数：{occurrence_count}\n"
+        f"出现次数：{occurrence_no}\n"
         f"是否确认：{status_text}\n"
     )
 
-    if review["operator_name"]:
-        text += f"确认人：{html.escape(review['operator_name'])}\n"
+    if safe_get(event, "operator_name"):
+        text += f"确认人：{html.escape(safe_get(event, 'operator_name'))}\n"
 
-    # 新增：每次管理员点击“出 / 不出”后的确认时间
-    if review["decided_at"]:
-        text += f"确认时间：{html.escape(review['decided_at'])}\n"
+    if safe_get(event, "decided_at"):
+        text += f"确认时间：{html.escape(safe_get(event, 'decided_at'))}\n"
 
     text += (
         f"\n发送内容：\n"
@@ -571,7 +631,7 @@ async def start(
 
     await update.message.reply_text(
         "USDT 地址审核机器人已启动。\n\n"
-        "每个群独立记录地址。新地址会 @ 当前群管理员，重复地址只记录出现次数。"
+        "每个群独立记录地址。新地址会 @ 当前群管理员；重复地址不 @，但每次都会有按钮。"
     )
 
 
@@ -585,15 +645,16 @@ async def stats(
     chat = update.effective_chat
 
     if chat and chat.type in ("group", "supergroup"):
-        total, pending, out_count, no_count = get_stats(chat.id)
+        total_address, total_event, pending, out_count, no_count = get_stats(chat.id)
         title = "📊 当前群地址审核统计"
     else:
-        total, pending, out_count, no_count = get_stats(None)
+        total_address, total_event, pending, out_count, no_count = get_stats(None)
         title = "📊 全部群地址审核统计"
 
     await update.message.reply_text(
         f"{title}\n\n"
-        f"全部命中地址：{total}\n"
+        f"去重地址数：{total_address}\n"
+        f"总出现次数：{total_event}\n"
         f"待处理：{pending}\n"
         f"已确认出：{out_count}\n"
         f"已确认不出：{no_count}"
@@ -631,9 +692,10 @@ async def handle_message(
     sender_name = get_user_name(user)
     sender_mention = get_user_mention(user)
     sender_id = user.id if user else None
+    message_sent_at = format_dt(message.date)
 
     for address in addresses:
-        review, is_new = create_or_update_review(
+        event, is_new_address = create_event_for_address(
             address=address,
             chat_id=chat.id,
             original_message_id=message.message_id,
@@ -641,35 +703,36 @@ async def handle_message(
             sender_name=sender_name,
             sender_mention=sender_mention,
             message_text=text,
+            message_sent_at=message_sent_at,
         )
 
-        keyboard = None
         admin_mentions = ""
 
-        if is_new:
+        # 当前群第一次出现该地址：@ 当前群管理员
+        # 当前群第 2 次及以上：不 @，但仍然给按钮
+        if is_new_address:
             admin_mentions = await get_admin_mentions(
                 context=context,
                 chat_id=chat.id,
             )
 
-        if review["status"] == "pending":
-            keyboard = InlineKeyboardMarkup(
+        keyboard = InlineKeyboardMarkup(
+            [
                 [
-                    [
-                        InlineKeyboardButton(
-                            "✅ 出",
-                            callback_data=f"review:{review['id']}:out",
-                        ),
-                        InlineKeyboardButton(
-                            "❌ 不出",
-                            callback_data=f"review:{review['id']}:no",
-                        ),
-                    ]
+                    InlineKeyboardButton(
+                        "✅ 出",
+                        callback_data=f"event:{event['id']}:out",
+                    ),
+                    InlineKeyboardButton(
+                        "❌ 不出",
+                        callback_data=f"event:{event['id']}:no",
+                    ),
                 ]
-            )
+            ]
+        )
 
-        alert_text = build_record_text(
-            review=review,
+        alert_text = build_event_text(
+            event=event,
             show_admin_mentions=admin_mentions,
         )
 
@@ -694,7 +757,7 @@ async def handle_button(
         return
 
     match = re.fullmatch(
-        r"review:(\d+):(out|no)",
+        r"event:(\d+):(out|no)",
         query.data or "",
     )
 
@@ -702,12 +765,12 @@ async def handle_button(
         await query.answer()
         return
 
-    review_id = int(match.group(1))
+    event_id = int(match.group(1))
     decision = match.group(2)
 
-    review = get_review(review_id)
+    event = get_event(event_id)
 
-    if not review:
+    if not event:
         await query.answer(
             "记录不存在",
             show_alert=True,
@@ -716,7 +779,7 @@ async def handle_button(
 
     admin = await is_admin(
         context=context,
-        chat_id=review["chat_id"],
+        chat_id=event["chat_id"],
         user_id=query.from_user.id,
     )
 
@@ -729,21 +792,21 @@ async def handle_button(
 
     operator_name = get_user_name(query.from_user)
 
-    success = finish_review(
-        review_id=review_id,
+    success = finish_event(
+        event_id=event_id,
         status=decision,
         operator_id=query.from_user.id,
         operator_name=operator_name,
     )
 
-    updated_review = get_review(review_id)
+    updated_event = get_event(event_id)
 
     if not success:
-        old_operator = updated_review["operator_name"] or "其他管理员"
+        old_operator = safe_get(updated_event, "operator_name", "其他管理员") or "其他管理员"
 
         try:
             await query.edit_message_text(
-                text=build_record_text(updated_review),
+                text=build_event_text(updated_event),
                 parse_mode="HTML",
                 reply_markup=None,
             )
@@ -761,7 +824,7 @@ async def handle_button(
     # 点击“出 / 不出”后，只编辑当前机器人消息，并显示确认人、确认时间
     try:
         await query.edit_message_text(
-            text=build_record_text(updated_review),
+            text=build_event_text(updated_event),
             parse_mode="HTML",
             reply_markup=None,
         )
@@ -799,6 +862,7 @@ def main():
     init_db()
 
     print(f"数据库位置：{DB_PATH}")
+    print(f"当前时间配置：{BOT_TIMEZONE}")
     print("USDT 地址审核机器人正在启动...")
 
     app = (
@@ -813,7 +877,7 @@ def main():
     app.add_handler(
         CallbackQueryHandler(
             handle_button,
-            pattern=r"^review:",
+            pattern=r"^event:",
         )
     )
 
