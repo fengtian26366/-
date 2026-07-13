@@ -10,7 +10,6 @@ from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    ReplyParameters,
 )
 from telegram.ext import (
     ApplicationBuilder,
@@ -23,7 +22,7 @@ from telegram.ext import (
 
 
 # ==================================================
-# 配置
+# Railway 配置
 # ==================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
@@ -58,13 +57,19 @@ logger = logging.getLogger(__name__)
 # USDT 地址识别
 # ==================================================
 
+# TRC20 USDT 地址：T 开头，34 位
 TRC20_PATTERN = re.compile(
     r"(?<![A-Za-z0-9])T[1-9A-HJ-NP-Za-km-z]{33}(?![A-Za-z0-9])"
 )
 
+# ERC20 / BEP20 / Polygon 等 EVM 地址：0x + 40 位十六进制
 EVM_PATTERN = re.compile(
     r"(?<![A-Za-z0-9])0x[a-fA-F0-9]{40}(?![A-Za-z0-9])"
 )
+
+
+def now_text() -> str:
+    return datetime.now().strftime("%Y/%m/%d %H:%M:%S")
 
 
 def normalize_address(address: str) -> str:
@@ -88,14 +93,8 @@ def get_address_type(address: str) -> str:
 
 def detect_addresses(text: str) -> list[str]:
     addresses = []
-
-    addresses.extend(
-        TRC20_PATTERN.findall(text)
-    )
-
-    addresses.extend(
-        EVM_PATTERN.findall(text)
-    )
+    addresses.extend(TRC20_PATTERN.findall(text))
+    addresses.extend(EVM_PATTERN.findall(text))
 
     result = []
     seen = set()
@@ -108,6 +107,15 @@ def detect_addresses(text: str) -> list[str]:
             result.append(address)
 
     return result
+
+
+def short_text(text: str, max_len: int = 800) -> str:
+    text = text.strip()
+
+    if len(text) <= max_len:
+        return text
+
+    return text[:max_len] + "..."
 
 
 # ==================================================
@@ -124,6 +132,21 @@ def db_conn():
     )
 
 
+def add_column_if_missing(
+    conn,
+    table_name: str,
+    column_name: str,
+    column_sql: str,
+):
+    cursor = conn.execute(f"PRAGMA table_info({table_name})")
+    columns = [row[1] for row in cursor.fetchall()]
+
+    if column_name not in columns:
+        conn.execute(
+            f"ALTER TABLE {table_name} ADD COLUMN {column_sql}"
+        )
+
+
 def init_db():
     with db_conn() as conn:
         conn.execute(
@@ -135,59 +158,140 @@ def init_db():
                 address_type TEXT NOT NULL,
                 chat_id INTEGER NOT NULL,
                 original_message_id INTEGER NOT NULL,
+                sender_id INTEGER,
                 sender_name TEXT,
+                sender_mention TEXT,
+                message_text TEXT,
+                occurrence_count INTEGER NOT NULL DEFAULT 1,
                 status TEXT NOT NULL DEFAULT 'pending',
                 operator_id INTEGER,
                 operator_name TEXT,
                 created_at TEXT NOT NULL,
+                last_seen_at TEXT,
                 decided_at TEXT
             )
             """
         )
 
+        # 兼容旧版数据库，自动补字段
+        add_column_if_missing(conn, "reviews", "sender_id", "sender_id INTEGER")
+        add_column_if_missing(conn, "reviews", "sender_mention", "sender_mention TEXT")
+        add_column_if_missing(conn, "reviews", "message_text", "message_text TEXT")
+        add_column_if_missing(conn, "reviews", "occurrence_count", "occurrence_count INTEGER NOT NULL DEFAULT 1")
+        add_column_if_missing(conn, "reviews", "last_seen_at", "last_seen_at TEXT")
+
         conn.commit()
 
 
-def create_review(
+def create_or_update_review(
     address: str,
     chat_id: int,
     original_message_id: int,
+    sender_id: int | None,
     sender_name: str,
+    sender_mention: str,
+    message_text: str,
 ):
+    """
+    返回：
+    review, is_new
+
+    is_new=True 代表第一次出现，需要 @ 管理员。
+    is_new=False 代表重复出现，不 @ 管理员，只记录出现次数。
+    """
+
     normalized = normalize_address(address)
 
-    try:
-        with db_conn() as conn:
-            cursor = conn.execute(
+    with db_conn() as conn:
+        conn.row_factory = sqlite3.Row
+
+        old = conn.execute(
+            """
+            SELECT *
+            FROM reviews
+            WHERE address_normalized = ?
+            """,
+            (normalized,),
+        ).fetchone()
+
+        if old:
+            conn.execute(
                 """
-                INSERT INTO reviews (
-                    address,
-                    address_normalized,
-                    address_type,
-                    chat_id,
-                    original_message_id,
-                    sender_name,
-                    status,
-                    created_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
+                UPDATE reviews
+                SET
+                    occurrence_count = occurrence_count + 1,
+                    last_seen_at = ?,
+                    message_text = ?
+                WHERE address_normalized = ?
                 """,
                 (
-                    address,
+                    now_text(),
+                    message_text,
                     normalized,
-                    get_address_type(address),
-                    chat_id,
-                    original_message_id,
-                    sender_name,
-                    datetime.now().isoformat(timespec="seconds"),
                 ),
             )
 
             conn.commit()
-            return cursor.lastrowid
 
-    except sqlite3.IntegrityError:
-        return None
+            review = conn.execute(
+                """
+                SELECT *
+                FROM reviews
+                WHERE address_normalized = ?
+                """,
+                (normalized,),
+            ).fetchone()
+
+            return review, False
+
+        cursor = conn.execute(
+            """
+            INSERT INTO reviews (
+                address,
+                address_normalized,
+                address_type,
+                chat_id,
+                original_message_id,
+                sender_id,
+                sender_name,
+                sender_mention,
+                message_text,
+                occurrence_count,
+                status,
+                created_at,
+                last_seen_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'pending', ?, ?)
+            """,
+            (
+                address,
+                normalized,
+                get_address_type(address),
+                chat_id,
+                original_message_id,
+                sender_id,
+                sender_name,
+                sender_mention,
+                message_text,
+                now_text(),
+                now_text(),
+            ),
+        )
+
+        review_id = cursor.lastrowid
+
+        conn.commit()
+
+        review = conn.execute(
+            """
+            SELECT *
+            FROM reviews
+            WHERE id = ?
+            """,
+            (review_id,),
+        ).fetchone()
+
+        return review, True
 
 
 def get_review(review_id: int):
@@ -229,7 +333,7 @@ def finish_review(
                 status,
                 operator_id,
                 operator_name,
-                datetime.now().isoformat(timespec="seconds"),
+                now_text(),
                 review_id,
             ),
         )
@@ -273,6 +377,18 @@ def get_user_name(user) -> str:
         return f"{name} (@{user.username})"
 
     return name
+
+
+def get_user_mention(user) -> str:
+    if not user:
+        return "未知用户"
+
+    if user.username:
+        return f"@{html.escape(user.username)}"
+
+    name = html.escape(user.full_name or str(user.id))
+
+    return f'<a href="tg://user?id={user.id}">{name}</a>'
 
 
 async def is_admin(
@@ -336,6 +452,71 @@ async def get_admin_mentions(
 
 
 # ==================================================
+# 消息内容
+# ==================================================
+
+def build_status_text(review) -> str:
+    status = review["status"]
+
+    if status == "pending":
+        return "⏳ 待确认"
+
+    if status == "out":
+        return "✅ 已确认出"
+
+    if status == "no":
+        return "❌ 已确认不出"
+
+    return status
+
+
+def build_record_text(
+    review,
+    show_admin_mentions: str = "",
+) -> str:
+    address = html.escape(review["address"])
+    address_type = html.escape(review["address_type"])
+    occurrence_count = review["occurrence_count"]
+    status_text = html.escape(build_status_text(review))
+
+    sender = (
+        review["sender_mention"]
+        or html.escape(review["sender_name"] or "未知用户")
+    )
+
+    message_text = html.escape(
+        short_text(review["message_text"] or "")
+    )
+
+    text = "🚨 <b>USDT 地址记录</b>\n\n"
+
+    # 只有第一次出现新地址时才会传 show_admin_mentions
+    if show_admin_mentions:
+        text += f"管理员：{show_admin_mentions}\n"
+
+    text += (
+        f"发送人：{sender}\n\n"
+        f"USDT 地址：\n<code>{address}</code>\n\n"
+        f"类型：{address_type}\n"
+        f"出现次数：{occurrence_count}\n"
+        f"是否确认：{status_text}\n"
+    )
+
+    if review["operator_name"]:
+        text += f"确认人：{html.escape(review['operator_name'])}\n"
+
+    if review["decided_at"]:
+        text += f"确认时间：{html.escape(review['decided_at'])}\n"
+
+    text += (
+        f"\n发送内容：\n"
+        f"<blockquote>{message_text}</blockquote>"
+    )
+
+    return text
+
+
+# ==================================================
 # 命令
 # ==================================================
 
@@ -348,7 +529,7 @@ async def start(
 
     await update.message.reply_text(
         "USDT 地址审核机器人已启动。\n\n"
-        "群里出现新的 USDT 地址后，我会自动提醒管理员选择：出 / 不出。"
+        "新地址会 @ 管理员，重复地址只记录出现次数。"
     )
 
 
@@ -363,10 +544,10 @@ async def stats(
 
     await update.message.reply_text(
         "📊 地址审核统计\n\n"
-        f"全部地址：{total}\n"
+        f"全部命中地址：{total}\n"
         f"待处理：{pending}\n"
-        f"已选择出：{out_count}\n"
-        f"已选择不出：{no_count}"
+        f"已确认出：{out_count}\n"
+        f"已确认不出：{no_count}"
     )
 
 
@@ -399,65 +580,57 @@ async def handle_message(
         return
 
     sender_name = get_user_name(user)
-
-    admin_mentions = await get_admin_mentions(
-        context=context,
-        chat_id=chat.id,
-    )
+    sender_mention = get_user_mention(user)
+    sender_id = user.id if user else None
 
     for address in addresses:
-        review_id = create_review(
+        review, is_new = create_or_update_review(
             address=address,
             chat_id=chat.id,
             original_message_id=message.message_id,
+            sender_id=sender_id,
             sender_name=sender_name,
+            sender_mention=sender_mention,
+            message_text=text,
         )
 
-        if review_id is None:
-            continue
+        keyboard = None
+        admin_mentions = ""
 
-        keyboard = InlineKeyboardMarkup(
-            [
+        # 只有第一次出现新地址时 @ 管理员
+        if is_new:
+            admin_mentions = await get_admin_mentions(
+                context=context,
+                chat_id=chat.id,
+            )
+
+        # 只要这个地址还没确认，就显示按钮。
+        # 重复出现时也会显示按钮，但不会 @ 管理员。
+        if review["status"] == "pending":
+            keyboard = InlineKeyboardMarkup(
                 [
-                    InlineKeyboardButton(
-                        "✅ 出",
-                        callback_data=f"review:{review_id}:out",
-                    ),
-                    InlineKeyboardButton(
-                        "❌ 不出",
-                        callback_data=f"review:{review_id}:no",
-                    ),
+                    [
+                        InlineKeyboardButton(
+                            "✅ 出",
+                            callback_data=f"review:{review['id']}:out",
+                        ),
+                        InlineKeyboardButton(
+                            "❌ 不出",
+                            callback_data=f"review:{review['id']}:no",
+                        ),
+                    ]
                 ]
-            ]
+            )
+
+        alert_text = build_record_text(
+            review=review,
+            show_admin_mentions=admin_mentions,
         )
 
-        safe_address = html.escape(address)
-        safe_address_type = html.escape(
-            get_address_type(address)
-        )
-
-        if admin_mentions:
-            mention_line = f"{admin_mentions}\n\n"
-        else:
-            mention_line = ""
-
-        alert_text = (
-            "🚨 <b>警报：发现新地址</b>\n\n"
-            f"{mention_line}"
-            f"类型：{safe_address_type}\n"
-            f"地址：<code>{safe_address}</code>\n\n"
-            "是否出款？"
-        )
-
-        await context.bot.send_message(
-            chat_id=chat.id,
+        await message.reply_text(
             text=alert_text,
             parse_mode="HTML",
             reply_markup=keyboard,
-            reply_parameters=ReplyParameters(
-                message_id=message.message_id,
-                allow_sending_without_reply=True,
-            ),
         )
 
 
@@ -517,51 +690,39 @@ async def handle_button(
         operator_name=operator_name,
     )
 
+    updated_review = get_review(review_id)
+
+    # 如果已经被其他管理员点过，则刷新当前按钮消息为最终状态
     if not success:
-        latest = get_review(review_id)
-        old_operator = latest["operator_name"] or "其他管理员"
+        old_operator = updated_review["operator_name"] or "其他管理员"
+
+        try:
+            await query.edit_message_text(
+                text=build_record_text(updated_review),
+                parse_mode="HTML",
+                reply_markup=None,
+            )
+
+        except Exception as e:
+            logger.warning("编辑已处理消息失败: %s", e)
 
         await query.answer(
             f"已经处理过了，操作人：{old_operator}",
             show_alert=True,
         )
+
         return
 
-    if decision == "out":
-        result = "✅ 出"
-    else:
-        result = "❌ 不出"
-
-    safe_result = html.escape(result)
-    safe_address = html.escape(review["address"])
-    safe_operator = html.escape(operator_name)
-    safe_type = html.escape(review["address_type"])
-
+    # 成功处理后，只编辑当前机器人警报消息，不额外再发第二条
     try:
-        await query.edit_message_reply_markup(
-            reply_markup=None
-        )
-    except Exception as e:
-        logger.warning("删除按钮失败: %s", e)
-
-    try:
-        await context.bot.send_message(
-            chat_id=review["chat_id"],
-            text=(
-                f"<b>{safe_result}</b>\n\n"
-                f"类型：{safe_type}\n"
-                f"地址：<code>{safe_address}</code>\n"
-                f"操作人：{safe_operator}"
-            ),
+        await query.edit_message_text(
+            text=build_record_text(updated_review),
             parse_mode="HTML",
-            reply_parameters=ReplyParameters(
-                message_id=review["original_message_id"],
-                allow_sending_without_reply=True,
-            ),
+            reply_markup=None,
         )
 
     except Exception as e:
-        logger.error("发送结果失败: %s", e)
+        logger.error("编辑确认结果失败: %s", e)
 
     await query.answer("操作成功")
 
