@@ -469,6 +469,60 @@ def get_sender_stats(chat_id: int, sender_id: int | None, sender_name: str | Non
     return success_count, fail_count
 
 
+
+def get_address_stats(chat_id: int, address_normalized: str):
+    """
+    统计当前群里这个地址的审核结果：
+    - 出款成功次数
+    - 不给出款次数
+    - 待处理次数
+    """
+    with db_conn() as conn:
+        success_count = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM events
+            WHERE chat_id = ?
+              AND address_normalized = ?
+              AND status = 'out'
+            """,
+            (
+                chat_id,
+                address_normalized,
+            ),
+        ).fetchone()[0]
+
+        fail_count = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM events
+            WHERE chat_id = ?
+              AND address_normalized = ?
+              AND status = 'no'
+            """,
+            (
+                chat_id,
+                address_normalized,
+            ),
+        ).fetchone()[0]
+
+        pending_count = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM events
+            WHERE chat_id = ?
+              AND address_normalized = ?
+              AND status = 'pending'
+            """,
+            (
+                chat_id,
+                address_normalized,
+            ),
+        ).fetchone()[0]
+
+    return success_count, fail_count, pending_count
+
+
 def get_stats(chat_id: int | None = None):
     with db_conn() as conn:
         if chat_id is None:
@@ -667,6 +721,11 @@ def build_event_text(
         sender_name=safe_get(event, "sender_name", None),
     )
 
+    address_success_count, address_fail_count, address_pending_count = get_address_stats(
+        chat_id=event["chat_id"],
+        address_normalized=event["address_normalized"],
+    )
+
     text = "🚨 <b>USDT 地址记录</b>\n\n"
 
     # 只有当前群第一次出现新地址才 @ 管理员
@@ -676,12 +735,16 @@ def build_event_text(
     text += (
         f"发送人：{sender}\n"
         f"发送时间：{html.escape(message_sent_at)}\n\n"
-        f"该发送人统计：\n"
+        f"本地址统计：\n"
+        f"出现次数：{occurrence_no} 次\n"
+        f"出款成功：{address_success_count} 次\n"
+        f"不给出款：{address_fail_count} 次\n"
+        f"待处理：{address_pending_count} 次\n\n"
+        f"该发送人总统计：\n"
         f"出款成功：{sender_success_count} 次\n"
         f"不给出款：{sender_fail_count} 次\n\n"
         f"USDT 地址：\n<code>{address}</code>\n\n"
         f"类型：{address_type}\n"
-        f"地址出现次数：{occurrence_no}\n"
         f"本次状态：{status_text}\n"
     )
 
