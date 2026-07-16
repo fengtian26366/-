@@ -197,6 +197,22 @@ def init_db():
             """
         )
 
+        # 去重锁表：
+        # 同一个群、同一条 Telegram 消息、同一个地址，只允许处理一次。
+        # 可以防止 Railway 重启、Telegram 重试、网络抖动造成重复发机器人消息。
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS processed_message_addresses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                original_message_id INTEGER NOT NULL,
+                address_normalized TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(chat_id, original_message_id, address_normalized)
+            )
+            """
+        )
+
         conn.commit()
 
 
@@ -226,6 +242,30 @@ def create_event_for_address(
 
     with db_conn() as conn:
         conn.row_factory = sqlite3.Row
+
+        # 同一条 Telegram 消息里的同一个地址，只处理一次。
+        # 如果这里已经存在记录，说明这条消息之前处理过，直接跳过。
+        lock_cursor = conn.execute(
+            """
+            INSERT OR IGNORE INTO processed_message_addresses (
+                chat_id,
+                original_message_id,
+                address_normalized,
+                created_at
+            )
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                chat_id,
+                original_message_id,
+                normalized,
+                now_text(),
+            ),
+        )
+
+        if lock_cursor.rowcount == 0:
+            conn.commit()
+            return None, False
 
         old = conn.execute(
             """
@@ -823,6 +863,10 @@ async def handle_message(
             message_text=text,
             message_sent_at=message_sent_at,
         )
+
+        # 已处理过的同一条消息，直接跳过，避免重复发机器人消息。
+        if event is None:
+            continue
 
         admin_mentions = ""
 
